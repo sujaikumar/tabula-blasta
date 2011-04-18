@@ -1,0 +1,108 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Getopt::Long qw(:config pass_through);
+
+my ($infile, $num_fasta, $outfile, $threads, $time, $num_jobs, $outfmt, $opt_F) = ("", "", "", 1,  "47:00:00","","","");
+GetOptions (
+  "i|query:s" => \$infile,
+  "num_fasta:i" => \$num_fasta,
+  "o|out:s" => \$outfile,
+  "a|num_threads:i" => \$threads,
+  "time:s" => \$time,
+  "num_jobs:i" => \$num_jobs,
+  "outfmt:s" => \$outfmt,
+  "F:s" => \$opt_F,
+);
+my $usage = <<Usage;
+bigmem_blast: No input found
+Usage: Prefix your regular blast command line by bigmem_blast
+  Example: bigmem_blast blastall -p blastn -i query.fa -d ~/blast.db -e 1e-3 -m 8 -o query.out
+  Example: bigmem_blast blastn -query query.fa -db ~/blast.db -evalue 1e-3 -outfmt 6 -out query.out
+  Use -num_jobs to specify number of jobs to split into. Default 20
+  Use -num_fasta to specify number of fasta sequences per split job.
+  Default (depends on num_jobs, num_jobs overrides num_fasta)
+Usage
+die $usage unless -r $infile;
+$outfile = "tmp" unless $outfile;
+
+my $command = join(' ',@ARGV);
+$command .= " -outfmt \"$outfmt\"" if $outfmt; #put quotes around -outfmt options
+$command .= " -F \"$opt_F\"" if $opt_F; #put quotes around -F options
+
+my $input_fh = &read_fh ($infile);
+my $count_sequences;
+while (<$input_fh>) { $count_sequences++ if /^>/ }
+$num_jobs = 20 unless $num_jobs or $num_fasta;
+if ($num_jobs) { $num_fasta = int($count_sequences/$num_jobs) + 1 }
+
+#------------------------------------------------------------------------------
+# Split multi-fasta file into many multi fasta files with $num_fasta sequences
+# and store the result in a tmp directory under the current working directory
+#------------------------------------------------------------------------------
+
+$input_fh = &read_fh ($infile);
+my $tmp_dir = "$outfile\_" . int(rand(10000));
+mkdir($tmp_dir) or die "Could not create tmp directory in current location.\n"
+    ." Please run from a location that you can write to.\n";
+my $count = 0;
+my $filenumber = 0;
+
+while ( my $line = <$input_fh> ) {
+    if ($line =~ /^>/) {
+        open OUTFILE, ">$tmp_dir/" . ++$filenumber . ".fasta"
+            or die "Unable to open split fasta file\n"
+            unless ($count % $num_fasta);
+        $count++;
+    }
+    print OUTFILE $line unless $line =~ /^\s*$/;
+}
+
+#------------------------------------------------------------------------------
+# run multiple blasts in tmp_dir
+#------------------------------------------------------------------------------
+
+for (1..$filenumber) {
+    if ($command =~ /blastall/ or $command =~ /megablast/) {
+        system("($command -i $tmp_dir/$_.fasta -a $threads | gzip >$tmp_dir/$_.out.gz; touch $tmp_dir/$_.done) &")
+    }
+    else {
+        system("($command -query $tmp_dir/$_.fasta -num_threads $threads | gzip >$tmp_dir/$_.out.gz; touch $tmp_dir/$_.done) &")
+    }
+}
+
+#------------------------------------------------------------------------------
+# test if all sub blasts done
+#------------------------------------------------------------------------------
+
+while (1) {
+    my $finished = 1;
+    for (1..$filenumber) { $finished = 0 if not -f "$tmp_dir/$_.done" }
+    last if $finished;
+    sleep 10;
+}
+
+#------------------------------------------------------------------------------
+# cat all results and remove tmp_dir if done
+#------------------------------------------------------------------------------
+
+unlink $outfile;
+for (1..$filenumber) { `cat $tmp_dir/$_.out.gz >> $outfile.gz` }
+system ("rm -rf $tmp_dir");
+
+########################
+#subroutines
+########################
+
+sub read_fh {
+    my $filename = shift @_;
+    my $filehandle;
+    if ($filename =~ /gz$/) {
+        open $filehandle, "gunzip -dc $filename |" or die $!;
+    }
+    else {
+        open $filehandle, "<$filename" or die $!;
+    }
+    return $filehandle;
+}
